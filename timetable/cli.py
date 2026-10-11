@@ -18,6 +18,14 @@ from timetable.merge import (
     merge_timetables,
     render_merge_conflicts,
 )
+from timetable.import_csv import (
+    ImportError_,
+    apply_import,
+    load_timetable_for_import,
+    plan_import,
+    render_plan,
+    save_timetable_atomic,
+)
 
 def validate_day(day_str):
     """Validates that day_str is a recognized weekday, ignoring case.
@@ -204,6 +212,40 @@ def cmd_stats(args):
 
     render_stats(stats)
 
+def cmd_import_csv(args):
+    """Imports classes from a CSV file, with optional dry-run preview."""
+    try:
+        timetable_data = load_timetable_for_import(args.file)
+        plan = plan_import(args.csv_file, timetable_data)
+    except ImportError_ as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if not plan.accepted:
+        print(render_plan(plan, dry_run=args.dry_run), file=sys.stderr)
+        if plan.invalid_records:
+            print("Error: Could not import CSV due to validation errors.", file=sys.stderr)
+        else:
+            print("Error: Could not import CSV due to scheduling conflicts.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.dry_run:
+        print(render_plan(plan, dry_run=True))
+        print("Dry run complete. No files were modified.")
+        sys.exit(0)
+
+    updated = apply_import(timetable_data, plan)
+    try:
+        save_timetable_atomic(updated, args.file)
+    except OSError as exc:
+        print(f"Error: Could not write timetable '{args.file}': {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print(render_plan(plan))
+    print(f"Successfully imported {len(plan.new_classes)} class(es) into '{args.file}'.")
+    sys.exit(0)
+
+
 def cmd_merge(args):
     """Merges two timetable JSON files with conflict detection."""
     try:
@@ -333,6 +375,19 @@ def main():
         help="Path to timetable JSON file (defaults to timetable.json)",
     )
     p_stats.set_defaults(func=cmd_stats)
+
+    # import-csv
+    p_import_csv = subparsers.add_parser(
+        "import-csv",
+        help="Import classes from a CSV file with validation, duplicate and conflict checks",
+    )
+    p_import_csv.add_argument("csv_file", help="Path to the CSV file to import")
+    p_import_csv.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate and preview the import without modifying the timetable",
+    )
+    p_import_csv.set_defaults(func=cmd_import_csv)
 
     # merge
     p_merge = subparsers.add_parser(
