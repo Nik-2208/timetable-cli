@@ -1,8 +1,13 @@
 """Command Line Interface for Timetable CLI."""
 
 import argparse
+import copy
+import json
+import os
 import sys
+import tempfile
 from pathlib import Path
+from typing import Any, Dict
 
 from timetable.loader import load_timetable, save_timetable, DEFAULT_FILEPATH
 from timetable.display import render_day, render_week, WEEKDAYS
@@ -12,6 +17,24 @@ from timetable.export import export_ics
 from timetable.diff import DiffError, diff_timetables, load_for_diff, render_diff
 from timetable.conflicts import find_conflicts, render_conflicts
 from timetable.stats import compute_stats, render_stats
+from timetable.history import (
+    DEFAULT_RETENTION_LIMIT,
+    ENV_HISTORY_LIMIT,
+    HistoryError,
+    SnapshotCorruptError,
+    SnapshotNotFoundError,
+    WriteFailureError,
+    default_retention_limit,
+    history_directory,
+    list_snapshots,
+    load_snapshot,
+    prune_snapshots,
+    render_timetable,
+    restore_snapshot,
+    save_snapshot,
+    show_snapshot,
+    validate_retention_limit,
+)
 from timetable.merge import (
     MergeError,
     load_timetable_for_merge,
@@ -102,6 +125,148 @@ def cmd_filter(args):
     render_filter(results, day=args.day, start=args.start, end=args.end, room=args.room)
 
 
+def _history_dir_for(args) -> Path:
+    """Return the history directory for the active timetable file."""
+    explicit = getattr(args, "history_dir", None)
+    if explicit is not None:
+        return Path(explicit)
+    return history_directory(Path(args.file))
+
+
+def _save_snapshot_before_file_write(
+    data: Dict[str, Any],
+    *,
+    filepath: Path,
+    operation: str,
+) -> str:
+    """Persist a snapshot of *data* before a successful file write.
+
+    Returns the snapshot id so callers can assert that a snapshot was created.
+    """
+    snapshot_id = save_snapshot(
+        data,
+        filepath=filepath,
+        operation=operation,
+        history_dir=history_directory(filepath),
+    )
+    prune_snapshots(history_directory(filepath), default_retention_limit())
+    return snapshot_id
+
+
+def _atomic_save_timetable(data: Dict[str, Any], filepath: Path) -> None:
+    """Write *data* to *filepath* atomically (write-to-temp then replace).
+
+    :func:`timetable.loader.save_timetable` truncates the destination before
+    writing, so a mid-write failure would leave a corrupted timetable.  This
+    helper writes a temporary file next to the target and renames it over the
+    target only after the JSON has been fully written and flushed.
+    """
+    path = Path(filepath)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name, suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _write_timetable_with_snapshot(
+    data: Dict[str, Any],
+    *,
+    filepath: Path,
+    operation: str,
+    previous: Dict[str, Any],
+) -> str:
+    """Snapshot *previous*, then atomically write *data* to *filepath*.
+
+    The snapshot records the timetable as it was *before* the mutation, so
+    restoring it undoes the change.  It is taken only after the caller has
+    validated the new data (i.e. when a write is genuinely about to happen),
+    and the write is atomic so a failure never leaves a partially written
+    timetable behind.  Returns the snapshot id.
+    """
+    snapshot_id = _save_snapshot_before_file_write(
+        previous, filepath=filepath, operation=operation
+    )
+    _atomic_save_timetable(data, filepath)
+    return snapshot_id
+
+
+def cmd_history(args):
+    """List snapshots, inspect one, or restore the timetable from one."""
+    history_dir = _history_dir_for(args)
+
+    if args.history_command == "show":
+        if not args.snapshot_id:
+            print("Error: 'history show' requires a snapshot id.", file=sys.stderr)
+            return 1
+        try:
+            show_snapshot(args.snapshot_id, history_dir)
+        except (SnapshotNotFoundError, SnapshotCorruptError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    if args.history_command == "restore":
+        if not args.snapshot_id:
+            print("Error: 'history restore' requires a snapshot id.", file=sys.stderr)
+            return 1
+        return cmd_restore(args)
+
+    # Default: list snapshots.
+    if args.limit is not None:
+        try:
+            limit = validate_retention_limit(args.limit)
+        except HistoryError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+    else:
+        limit = default_retention_limit()
+
+    snapshots = list_snapshots(history_dir, limit=limit)
+    if not snapshots:
+        print("No snapshots found.")
+        return 0
+
+    for snapshot in snapshots:
+        created = snapshot.get("created_at") or "unknown"
+        operation = snapshot.get("operation") or "unknown"
+        print(f"{snapshot['id']}  {created}  {operation}")
+    return 0
+
+
+def cmd_restore(args):
+    """Restore the active timetable from a snapshot."""
+    history_dir = _history_dir_for(args)
+    if not args.snapshot_id:
+        print("Error: 'restore' requires a snapshot id.", file=sys.stderr)
+        return 1
+
+    try:
+        result = restore_snapshot(
+            args.snapshot_id,
+            filepath=Path(args.file),
+            history_dir=history_dir,
+        )
+    except (SnapshotNotFoundError, SnapshotCorruptError, WriteFailureError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    prune_snapshots(history_dir, default_retention_limit())
+    print(f"Restored snapshot '{result['id']}' into '{args.file}'.")
+    return 0
+
+
 def cmd_export(args):
     data = load_timetable(args.file)
     export_ics(data, args.output)
@@ -118,6 +283,7 @@ def cmd_add(args):
         sys.exit(1)
 
     data = load_timetable(args.file)
+    previous_state = copy.deepcopy(data)
     if day not in data:
         data[day] = []
 
@@ -139,7 +305,15 @@ def cmd_add(args):
     })
     data[day].sort(key=lambda s: s.get("start", ""))
 
-    save_timetable(data, args.file)
+    # Snapshot the timetable as it was *before* this addition (so restoring
+    # undoes it), then write atomically.  Validation above already succeeded,
+    # so the write is genuinely attempted here.
+    _write_timetable_with_snapshot(
+        data,
+        filepath=Path(args.file),
+        operation="add",
+        previous=previous_state,
+    )
     print(f"Successfully added '{args.subject}' to {day.capitalize()}.")
 
 
@@ -244,7 +418,25 @@ def cmd_merge(args):
         sys.exit(1)
 
     if output_path:
-        save_timetable(merged_data, output_path)
+        previous_state = None
+        output_file = Path(output_path)
+        if output_file.exists():
+            try:
+                previous_state = load_timetable(output_file)
+            except (OSError, ValueError):
+                previous_state = None
+
+        if previous_state is None:
+            # Nothing meaningful to preserve (new or unreadable output file);
+            # just write the merged data atomically.
+            _atomic_save_timetable(merged_data, output_file)
+        else:
+            _write_timetable_with_snapshot(
+                merged_data,
+                filepath=output_file,
+                operation="merge",
+                previous=previous_state,
+            )
         print(f"Successfully merged timetables into '{args.output}'.")
     else:
         print("Successfully merged timetables (dry run, no --output specified).")
@@ -345,12 +537,61 @@ def main():
     p_merge.add_argument("--force", action="store_true", help="Overwrite output file if it already exists")
     p_merge.set_defaults(func=cmd_merge)
 
+    # history
+    p_history = subparsers.add_parser(
+        "history",
+        help="Inspect timetable snapshots and restore previous states",
+    )
+    p_history.add_argument(
+        "history_command",
+        nargs="?",
+        choices=["list", "show", "restore"],
+        default="list",
+        help="Subcommand (default: list)",
+    )
+    p_history.add_argument(
+        "snapshot_id",
+        nargs="?",
+        help="Snapshot identifier (required for show / restore).",
+    )
+    p_history.add_argument(
+        "--limit",
+        type=int,
+        help="Maximum number of snapshots to list (positive integer). "
+        "Defaults to %d or $%s if set." % (DEFAULT_RETENTION_LIMIT, ENV_HISTORY_LIMIT),
+    )
+    p_history.add_argument(
+        "--history-dir",
+        type=Path,
+        default=None,
+        help="Directory in which snapshots are stored "
+        "(defaults to .timetable-history next to the timetable).",
+    )
+    p_history.set_defaults(func=cmd_history)
+
+    # restore
+    p_restore = subparsers.add_parser(
+        "restore",
+        help="Restore the active timetable from a snapshot",
+    )
+    p_restore.add_argument("snapshot_id", help="Snapshot identifier to restore.")
+    p_restore.add_argument(
+        "--history-dir",
+        type=Path,
+        default=None,
+        help="Directory in which snapshots are stored "
+        "(defaults to .timetable-history next to the timetable).",
+    )
+    p_restore.set_defaults(func=cmd_restore)
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
         sys.exit(0)
 
-    args.func(args)
+    result = args.func(args)
+    if isinstance(result, int) and result != 0:
+        sys.exit(result)
 
 
 if __name__ == "__main__":
