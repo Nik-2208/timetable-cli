@@ -13,6 +13,8 @@ python3 -m timetable now
 python3 -m timetable export
 python3 -m timetable filter --day monday --start 09:00 --end 12:00
 python3 -m timetable add --day friday --subject "Maths" --start 09:00 --end 10:00 --room "Room 101"
+python3 -m timetable import-csv semester.csv --dry-run
+python3 -m timetable import-csv semester.csv
 python3 -m unittest discover tests
 ```
 
@@ -30,6 +32,7 @@ On Windows, use `python` instead of `python3`.
 | `add --day --subject --start --end --room` | Adds a class |
 | `diff <first> <second>` | Compares two timetable files and reports what changed |
 | `merge <first> <second> [--output OUT] [--force]` | Combines two timetables into one with conflict detection |
+| `import-csv <file> [--dry-run]` | Imports classes from a CSV file with validation, duplicate detection and conflict checks |
 
 ## How it's supposed to work
 
@@ -67,6 +70,59 @@ python3 -m timetable filter --day monday --room "Lab 1" --start 09:00 --end 14:0
 ```
 
 `filter` shows only the classes matching `--day`, `--start`/`--end` (a time range) and/or `--room`. Every option is optional and they combine: only the classes that satisfy all the given filters are shown. The time range is half-open, so a class matches when it overlaps the range; a class that only touches a boundary (for example one ending exactly at `--start`, or starting exactly at `--end`) is not included. `--day` ignores capital letters and `--room` matches exactly. If nothing matches it just says so.
+## Importing classes from CSV
+
+```bash
+python3 -m timetable import-csv semester.csv
+python3 -m timetable import-csv semester.csv --dry-run
+```
+
+`import-csv` reads a CSV file and adds many classes to the timetable in one step. Use the existing global `--file` option if the timetable is not the default `timetable.json`, for example `python3 -m timetable --file timetable.json import-csv semester.csv`.
+
+The CSV must have a header row with these five columns:
+
+```csv
+day,subject,start,end,room
+```
+
+Column names are matched ignoring capital letters and surrounding spaces, so `Day`, `DAY` and `day` are all accepted. A realistic file looks like this:
+
+```csv
+day,subject,start,end,room
+Monday,Data Structures,09:00,10:30,Lab 1
+Monday,Mathematics,11:00,12:00,Room 101
+Tuesday,Operating Systems,14:00,15:00,Room 204
+```
+
+The whole file is checked before anything is written:
+
+- Required columns must all be present, and duplicate headers are rejected.
+- Every value must be filled in, weekday names must be real days, and times must be valid 24-hour `HH:MM` values.
+- A class must end after it starts, like `add`.
+- Invalid records are reported with their CSV row number and a specific message, and several errors are collected together when there is more than one.
+- An empty file, or a file with only the header row, is treated as an import with nothing to add.
+
+Duplicate handling:
+
+- A class is a duplicate when its day, subject, start time, end time and room all match an existing class, either elsewhere in the CSV or already in the timetable.
+- Duplicates inside the CSV are skipped after the first identical row, so repeating a row does not create repeated timetable entries.
+- Classes already in the timetable are skipped too, and the skipped entries are listed in the summary.
+- The same subject at a different time, or with a different room, is a distinct class and is imported normally.
+
+Conflict handling:
+
+- After duplicates are removed, any two overlapping classes on the same day conflict. Intervals are half-open, so `09:00-10:00` and `10:00-11:00` do not conflict, while `09:00-10:30` and `10:00-11:00` do.
+- Conflicts are checked both between new CSV rows and between new rows and classes already in the timetable. Classes on different days never conflict.
+- Each conflicting pair is reported once, showing both classes with their day, time, subject and room. Any conflict rejects the entire import, so nothing is added or removed.
+
+Dry run and safety:
+
+- `--dry-run` performs the same parsing, validation, duplicate and conflict checks as a real import, prints the same summary, and exits without writing anything.
+- A rejected import, whether from validation errors or conflicts, leaves `timetable.json` exactly as it was.
+- A successful import writes the file atomically: it writes a temporary file in the same directory and replaces the timetable only after the write succeeds. If writing fails, the temporary file is cleaned up and the original timetable is left untouched.
+- Accepted classes are appended to their day and that day is re-sorted by start time, like the rest of the CLI.
+- Exit code `0` means the import or dry run succeeded; any validation error, conflict, missing file, unreadable timetable JSON or write failure returns a non-zero exit code and never reports success.
+
 ## Comparing two timetables
 
 ```bash
@@ -131,6 +187,7 @@ python3 -m timetable restore snap-20260101120000000000-000000
 - `timetable/filter.py`: reusable filtering by day, time range and room
 - `timetable/diff.py`: comparing two timetable files
 - `timetable/merge.py`: combining timetables with deduplication and conflict detection
+- `timetable/import_csv.py`: parsing, validating, planning and safely writing CSV imports
 - `timetable/cli.py`: the commands
 - `tests/`: tests, run with `python3 -m unittest discover tests`
 
