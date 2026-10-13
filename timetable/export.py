@@ -51,14 +51,10 @@ def escape_text(value):
     )
 
 
-def make_uid(day, index, start, subject):
-    """Builds a stable, unique UID for one event.
-
-    Deterministic (no randomness or clock), so repeated exports of the same
-    timetable produce identical files.
-    """
+def make_uid(day, start, end, subject, room):
+    """Builds a deterministic UID independent of class list position."""
     stamp = hashlib.sha1(
-        f"{day}|{index}|{start}|{subject}".encode("utf-8")
+        f"{day}|{start}|{end}|{subject}|{room}".encode("utf-8")
     ).hexdigest()[:16]
     return f"{stamp}@timetable-cli"
 
@@ -70,8 +66,7 @@ def build_event(day, index, slot):
     start = parse_time(slot.get("start", "00:00"))
     end = parse_time(slot.get("end", "00:00"))
     day_date = reference_date(day)
-    uid = make_uid(day, index, slot.get("start", ""), summary)
-
+    uid = make_uid(day,slot.get("start", ""),slot.get("end", ""),summary,room,)
     # An overnight class ends before it starts on the clock (e.g. 23:00 to
     # 01:00), so its end falls on the following calendar day. Without this
     # DTEND would be earlier than DTSTART, which is invalid.
